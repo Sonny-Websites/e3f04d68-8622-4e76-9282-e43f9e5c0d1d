@@ -1,0 +1,190 @@
+name: Bootstrap Wix Headless Site
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_name:
+        description: Brand / display name for the site (passed from n8n)
+        required: true
+        type: string
+      site_prompt:
+        description: Full natural-language site brief (passed from n8n)
+        required: true
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: bootstrap-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Codex + Wix Headless bootstrap
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      SITE_NAME: ${{ inputs.site_name }}
+      SITE_PROMPT: ${{ inputs.site_prompt }}
+      CI: "true"
+      TRIGGERED_BY: ${{ github.actor }}
+      RUN_ID: ${{ github.run_id }}
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+      preview_url: ${{ steps.preview.outputs.preview_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Authenticate Wix CLI
+        env:
+          WIX_CLI_API_KEY: ${{ secrets.WIX_CLI_API_KEY }}
+        run: bash scripts/verify-wix-auth.sh
+
+      - name: Install Wix Headless skill
+        run: bash scripts/install-wix-headless-skill.sh
+
+      - name: Prepare bootstrap context
+        run: bash scripts/prepare-bootstrap-context.sh
+
+      - name: Render Codex bootstrap prompt
+        run: |
+          node --input-type=module - <<'EOF'
+          import { readFileSync, writeFileSync } from 'node:fs';
+
+          const ctx = JSON.parse(readFileSync('.github/codex/.bootstrap-context.json', 'utf8'));
+          let prompt = readFileSync('.github/codex/prompts/bootstrap.md', 'utf8');
+          prompt = prompt
+            .replaceAll('{{SITE_NAME}}', ctx.siteName)
+            .replaceAll('{{SITE_PROMPT}}', ctx.sitePrompt);
+          writeFileSync('.github/codex/prompts/bootstrap.rendered.md', prompt);
+          console.log('Rendered .github/codex/prompts/bootstrap.rendered.md');
+          EOF
+
+      - name: Generate Codex config from template
+        run: bash scripts/restore-codex-config.sh
+
+      - name: Run Codex with Wix Headless skill
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/bootstrap.rendered.md
+          output-file: .github/codex/bootstrap-output.md
+          codex-home: .github/codex
+          codex-args: '--profile factory'
+          sandbox: danger-full-access
+          safety-strategy: drop-sudo
+          model: gpt-5.3-codex
+
+      - name: Commit generated project
+        env:
+          GIT_USER_NAME: github-actions[bot]
+          GIT_USER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: bash scripts/commit-generated.sh
+
+      - name: Install project dependencies
+        run: |
+          if [[ ! -f "${{ env.PROJECT_DIR }}/wix.config.json" ]]; then
+            echo "No wix.config.json in ${{ env.PROJECT_DIR }}/ — bootstrap may not have scaffolded." >&2
+            exit 1
+          fi
+          bash scripts/npm-install-project.sh "${{ env.PROJECT_DIR }}"
+
+      - name: Build and publish Wix preview
+        id: preview
+        env:
+          WIX_CLI_API_KEY: ${{ secrets.WIX_CLI_API_KEY }}
+          PROJECT_DIR: ${{ env.PROJECT_DIR }}
+        run: bash scripts/run-preview-for-ci.sh
+
+      - name: Record preview URL on main
+        env:
+          GIT_USER_NAME: github-actions[bot]
+          GIT_USER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          git add .wix/run.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No run.json changes to commit"
+          else
+            git commit -m "Record Wix preview URL (run ${{ github.run_id }})"
+            git push origin HEAD
+          fi
+
+      - name: Upload bootstrap artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bootstrap-${{ github.run_id }}
+          path: |
+            .github/codex/bootstrap-output.md
+            .wix/run.json
+          if-no-files-found: ignore
+
+  notify:
+    name: Summarize bootstrap outcome
+    runs-on: ubuntu-latest
+    needs: bootstrap
+    if: always()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Notify n8n webhook
+        continue-on-error: true
+        env:
+          N8N_WEBHOOK_URL_TEST: ${{ secrets.N8N_WEBHOOK_URL_TEST }}
+          N8N_WEBHOOK_URL_PROD: ${{ secrets.N8N_WEBHOOK_URL_PROD }}
+          N8N_WEBHOOK_SECRET: ${{ secrets.N8N_WEBHOOK_SECRET }}
+          WEBHOOK_EVENT: bootstrap.completed
+          JOB_RESULT: ${{ needs.bootstrap.result }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          SITE_NAME: ${{ inputs.site_name }}
+          SITE_PROMPT: ${{ inputs.site_prompt }}
+          PROJECT_DIR: site
+          PREVIEW_URL: ${{ needs.bootstrap.outputs.preview_url }}
+          FINAL_MESSAGE: ${{ needs.bootstrap.outputs.final_message }}
+        run: bash scripts/notify-webhook.sh
+
+      - name: Write job summary
+        env:
+          FINAL_MESSAGE: ${{ needs.bootstrap.outputs.final_message }}
+          PREVIEW_URL: ${{ needs.bootstrap.outputs.preview_url }}
+        run: |
+          USER_SUMMARY="$(bash scripts/render-user-summary.sh 2>/dev/null || true)"
+          {
+            echo "## Wix Headless bootstrap"
+            echo ""
+            echo "| Input | Value |"
+            echo "| --- | --- |"
+            echo "| Site name | ${{ inputs.site_name }} |"
+            echo "| Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
+            if [[ -n "$USER_SUMMARY" ]]; then
+              echo ""
+              echo "### Your site"
+              echo "$USER_SUMMARY"
+            fi
+            if [[ -n "$PREVIEW_URL" ]]; then
+              echo ""
+              echo "**Preview:** $PREVIEW_URL"
+              echo ""
+              echo "When approved, run **Deploy Wix Headless Site (production)** to publish live."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
